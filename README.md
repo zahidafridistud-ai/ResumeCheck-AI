@@ -80,6 +80,7 @@ Google renames and retires models over time. If you get a "model not found" erro
 |---|---|
 | "Almost no text could be extracted" | The PDF is a scanned image. Export a text-based PDF or use DOCX. |
 | "Gemini rejected the API key" | Re-copy the key; make sure it has no spaces or quotes inside. |
+| 503 "high demand" / UNAVAILABLE | Temporary Google overload. The app retries automatically (waits 2s, 4s) and then tries backup models (`gemini-2.5-flash`, `gemini-3-flash-preview`). If it still fails, wait a minute and click Analyze again. |
 | Rate limit / quota error | Wait a minute; the free tier has per-minute limits. |
 | Model not found | Change the model name in the sidebar. |
 | Build fails on Streamlit Cloud | Confirm `requirements.txt` is in the repo root and spelled correctly. |
@@ -90,4 +91,4 @@ The resume text is sent to the Google Gemini API for analysis. The app does not 
 
 ## Disclaimer
 
-The score is an AI-assisted estimate of ATS-friendliness, not the output of any real employer's ATS. Use it as guidance for improving your resume.# ResumeCheck-AI
+The score is an AI-assisted estimate of ATS-friendliness, not the output of any real employer's ATS. Use it as guidance for improving your resume.
