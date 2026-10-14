@@ -13,7 +13,9 @@ UI: Streamlit  |  AI: Google Gemini Flash (google-genai SDK)
 import io
 import json
 import os
+import random
 import re
+import time
 
 import streamlit as st
 
@@ -21,6 +23,10 @@ import streamlit as st
 # Configuration
 # --------------------------------------------------------------------------- #
 DEFAULT_MODEL = "gemini-3.5-flash"  # change in the sidebar or via GEMINI_MODEL
+# Tried in order if the main model is overloaded (503) or rate limited (429)
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-3-flash-preview"]
+RETRIES_PER_MODEL = 3               # attempts per model before moving on
+BACKOFF_SECONDS = 2                 # waits 2s, 4s, ... between attempts
 MAX_RESUME_CHARS = 20_000           # keeps the prompt small & fast
 MAX_JD_CHARS = 8_000
 MAX_FILE_MB = 5
@@ -199,10 +205,31 @@ def parse_json(raw: str) -> dict:
         raise
 
 
-def call_gemini(prompt: str, api_key: str, model: str) -> dict:
-    """Call Gemini and return the parsed JSON (retries once on bad JSON)."""
+def is_transient(err: Exception) -> bool:
+    """True for temporary Google-side problems worth retrying (503, 500, 429...)."""
+    low = str(err).lower()
+    markers = (
+        "503", "500", "504", "429", "unavailable", "overloaded", "high demand",
+        "deadline", "resource_exhausted", "internal error", "timed out", "timeout",
+    )
+    return any(m in low for m in markers)
+
+
+def call_gemini(prompt: str, api_key: str, model: str, on_status=None, sleep=time.sleep) -> dict:
+    """
+    Call Gemini and return parsed JSON.
+
+    * Temporary errors (503 'high demand', 429, timeouts) are retried with
+      exponential backoff, then the next model in FALLBACK_MODELS is tried.
+    * Bad JSON is retried once per attempt.
+    * Permanent errors (bad key, etc.) are raised immediately.
+    """
     from google import genai
     from google.genai import types
+
+    def say(msg: str) -> None:
+        if on_status:
+            on_status(msg)
 
     client = genai.Client(api_key=api_key)
     config = types.GenerateContentConfig(
@@ -211,16 +238,40 @@ def call_gemini(prompt: str, api_key: str, model: str) -> dict:
         temperature=0.2,
     )
 
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_err = None
-    for _ in range(2):
-        response = client.models.generate_content(
-            model=model, contents=prompt, config=config
-        )
-        try:
-            return parse_json(response.text)
-        except (json.JSONDecodeError, ValueError, TypeError) as err:
-            last_err = err
-    raise ValueError(f"The AI returned an unreadable response ({last_err}). Please try again.")
+
+    for model_index, name in enumerate(models):
+        for attempt in range(1, RETRIES_PER_MODEL + 1):
+            try:
+                response = client.models.generate_content(
+                    model=name, contents=prompt, config=config
+                )
+                try:
+                    return parse_json(response.text)
+                except (json.JSONDecodeError, ValueError, TypeError) as err:
+                    last_err = ValueError(f"The AI returned an unreadable response ({err}).")
+                    say("The AI response was malformed, retrying...")
+                    continue
+            except Exception as err:  # SDK raises various error classes
+                last_err = err
+                low = str(err).lower()
+                if "404" in low or "not found" in low:
+                    # Unknown model: if it's the user's main model, tell them; else skip it
+                    if model_index == 0:
+                        raise
+                    break
+                if not is_transient(err):
+                    raise  # bad API key, invalid request, etc.
+                if attempt < RETRIES_PER_MODEL:
+                    wait = BACKOFF_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                    say(f"Gemini is busy ({name}). Retrying in {wait:.0f}s "
+                        f"(attempt {attempt + 1}/{RETRIES_PER_MODEL})...")
+                    sleep(wait)
+        if model_index + 1 < len(models):
+            say(f"{name} is overloaded. Switching to {models[model_index + 1]}...")
+
+    raise last_err if last_err else RuntimeError("Gemini request failed.")
 
 
 # --------------------------------------------------------------------------- #
@@ -306,6 +357,9 @@ def friendly_error(err: Exception) -> str:
         return "Gemini rejected the API key. Check that it is correct and active."
     if "429" in low or "quota" in low or "resource_exhausted" in low or "rate limit" in low:
         return "Gemini rate limit / quota reached. Wait a minute and try again."
+    if "503" in low or "unavailable" in low or "high demand" in low or "overloaded" in low:
+        return ("Google's Gemini servers are overloaded right now (the app already retried and "
+                "tried backup models). Please wait a minute and click Analyze again.")
     if "404" in low or "not found" in low:
         return "That model name was not found. Change the model in the sidebar (e.g. gemini-2.5-flash)."
     return f"Something went wrong: {msg}"
@@ -443,8 +497,13 @@ def main() -> None:
         prompt = build_prompt(text[:MAX_RESUME_CHARS], job_description.strip()[:MAX_JD_CHARS], checks)
 
         try:
+            status = st.empty()
             with st.spinner("Analyzing with Gemini..."):
-                raw = call_gemini(prompt, api_key, model.strip() or DEFAULT_MODEL)
+                raw = call_gemini(
+                    prompt, api_key, model.strip() or DEFAULT_MODEL,
+                    on_status=lambda msg: status.info(msg),
+                )
+            status.empty()
             result = normalise_result(raw)
         except Exception as err:
             st.error(friendly_error(err))
